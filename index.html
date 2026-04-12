@@ -1,0 +1,1388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>PAL MENS WEAR — Staff Portal</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+
+<!-- ════════════════════════════════════════════════
+     STEP 1 — PASTE YOUR FIREBASE CONFIG BELOW
+     Go to: console.firebase.google.com
+     → Your project → Project settings → Your apps → Config
+     Replace every value below with your own values
+════════════════════════════════════════════════ -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, set, get, update, onValue, push, remove }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey:            "AIzaSyCElHLPs1Qnw_otnB16XrWz7wcU1f0aln4",
+  authDomain:        "pal-mens-wear.firebaseapp.com",
+  databaseURL:       "https://pal-mens-wear-default-rtdb.firebaseio.com",
+  projectId:         "pal-mens-wear",
+  storageBucket:     "pal-mens-wear.firebasestorage.app",
+  messagingSenderId: "408086662597",
+  appId:             "1:408086662597:web:ce42c175a2e21e3de70fac"
+};
+
+const app = initializeApp(firebaseConfig);
+const db  = getDatabase(app);
+
+/* ═══════════ GLOBALS ═══════════ */
+const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const DAYS   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const AVC    = [
+  {bg:'#E6F1FB',cl:'#0C447C'},{bg:'#E1F5EE',cl:'#085041'},
+  {bg:'#FAEEDA',cl:'#633806'},{bg:'#EEEDFE',cl:'#3C3489'},
+  {bg:'#FAECE7',cl:'#712B13'},{bg:'#EAF3DE',cl:'#27500A'},
+  {bg:'#FBEAF0',cl:'#72243E'},{bg:'#F1EFE8',cl:'#5F5E5A'}
+];
+
+let currentUser = null;
+let employees   = [];
+let tasks       = {};      // tasks[empId] = { checklist:{id:{...}}, delegation:{id:{...}} }
+let selMonth    = new Date().getMonth();
+let clDate      = new Date();
+let dlDate      = new Date();
+let editingTask = null;
+let editingEmp  = null;
+let liveUnsub   = null;   // firebase listener unsubscribe
+
+/* ═══════════ HELPERS ═══════════ */
+const fmtDate  = d => d.toISOString().split('T')[0];
+const fmtDisp  = d => DAYS[d.getDay()]+', '+d.getDate()+' '+MONTHS[d.getMonth()]+' '+d.getFullYear();
+const shiftDay = (d,n) => { const x=new Date(d); x.setDate(x.getDate()+n); return x; };
+const timeNow  = () => new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
+const dateNow  = () => new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+const fullNow  = () => ({ time: timeNow(), date: dateNow(), month: new Date().getMonth(), year: new Date().getFullYear() });
+const isAdmin  = () => currentUser?.access === 'admin';
+const isMgr    = () => currentUser?.access === 'manager';
+const isStaff  = () => currentUser?.access === 'staff';
+
+function avC(emp) {
+  const i = employees.indexOf(emp) % AVC.length;
+  return AVC[i < 0 ? 0 : i];
+}
+function avEl(emp, sz) {
+  const c   = avC(emp);
+  const ini = emp.name.split(' ').map(w=>w[0]).join('').slice(0,2);
+  return `<div style="width:${sz}px;height:${sz}px;border-radius:50%;background:${c.bg};color:${c.cl};display:flex;align-items:center;justify-content:center;font-size:${sz>32?12:10}px;font-weight:700;flex-shrink:0">${ini}</div>`;
+}
+function freqTag(f) {
+  const m = {daily:'f-daily Daily',weekly:'f-weekly Weekly',monthly:'f-monthly Monthly',yearly:'f-yearly Yearly',once:'f-once Once'};
+  const p = (m[f]||'f-once '+f).split(' ');
+  return `<span class="freq-tag ${p[0]}">${p.slice(1).join(' ')}</span>`;
+}
+function schedDisp(t) {
+  if (!t.schedDate || t.freq==='daily' || t.freq==='once') return '';
+  const d = new Date(t.schedDate+'T00:00:00');
+  if (t.freq==='weekly')  return `Every ${DAYS[d.getDay()]} from ${d.getDate()} ${MONTHS[d.getMonth()]}`;
+  if (t.freq==='monthly') return `Every ${d.getDate()} of the month`;
+  if (t.freq==='yearly')  return `Every ${d.getDate()} ${MONTHS[d.getMonth()]}`;
+  return '';
+}
+function schedTimeDisp(t) {
+  if (!t.schedTime) return '';
+  return `By ${t.schedTime}`;
+}
+function parseTimeToMinutes(timeStr) {
+  // Handles both '09:30' (24hr) and '09:30 AM'/'01:08 PM' (12hr)
+  if (!timeStr) return -1;
+  timeStr = timeStr.trim();
+  let hours = 0, mins = 0;
+  if (timeStr.includes('AM') || timeStr.includes('PM')) {
+    // 12-hour format: '01:08 PM'
+    const parts = timeStr.replace(/AM|PM/g,'').trim().split(':');
+    hours = parseInt(parts[0]);
+    mins  = parseInt(parts[1]);
+    if (timeStr.includes('PM') && hours !== 12) hours += 12;
+    if (timeStr.includes('AM') && hours === 12) hours = 0;
+  } else {
+    // 24-hour format: '11:25'
+    const parts = timeStr.split(':');
+    hours = parseInt(parts[0]);
+    mins  = parseInt(parts[1]);
+  }
+  return hours * 60 + mins;
+}
+function getTaskStatus(t, viewDate=null) {
+  // Returns: 'done-ontime' | 'done-late' | 'missed' | 'pending'
+  if (t.freq==='once') return t.done ? 'done-ontime' : 'pending';
+  if (t.done) {
+    if (!t.schedTime || !t.doneAt) return 'done-ontime';
+    const schedMins = parseTimeToMinutes(t.schedTime);
+    const doneMins  = parseTimeToMinutes(t.doneAt);
+    if (schedMins < 0 || doneMins < 0) return 'done-ontime';
+    return doneMins <= schedMins ? 'done-ontime' : 'done-late';
+  }
+  // Not done — check if scheduled time has passed
+  if (t.schedTime) {
+    const ref = viewDate || new Date();
+    const refMins = ref.getHours() * 60 + ref.getMinutes();
+    const schedMins = parseTimeToMinutes(t.schedTime);
+    // If viewing a past date, all undone tasks with schedTime are missed
+    const today = fmtDate(new Date());
+    const viewStr = viewDate ? fmtDate(viewDate) : today;
+    if (viewStr < today) return 'missed';
+    if (schedMins >= 0 && refMins > schedMins) return 'missed';
+  }
+  return 'pending';
+}
+function calcPerformanceScore(taskList, filterMonth=null, filterYear=null) {
+  // Filter by month/year if specified
+  let list = taskList;
+  if (filterMonth !== null && filterYear !== null) {
+    list = taskList.filter(t => {
+      if (t.done) return t.doneMonth === filterMonth && t.doneYear === filterYear;
+      // Not done — include in missed/pending for current month
+      const now = new Date();
+      return filterMonth === now.getMonth() && filterYear === now.getFullYear();
+    });
+  }
+  if (!list.length) return {score:100, onTime:0, late:0, missed:0, pending:0, total:0};
+  let onTime=0, late=0, missed=0, pending=0;
+  list.forEach(t => {
+    const s = getTaskStatus(t);
+    if (s==='done-ontime') onTime++;
+    else if (s==='done-late') late++;
+    else if (s==='missed') missed++;
+    else pending++;
+  });
+  const total = list.length;
+  // Score: on-time=100pts, late=60pts, missed=0pts, pending=80pts
+  const score = total ? Math.round((onTime*100 + late*60 + pending*80) / total) : 100;
+  return {score, onTime, late, missed, pending, total};
+}
+function freqHint(f) {
+  if (f==='weekly')  return 'Pick the start day of this week';
+  if (f==='monthly') return 'Pick the date it repeats monthly';
+  if (f==='yearly')  return 'Pick the date it repeats yearly';
+  return '';
+}
+function getPct(list) {
+  if (!list || !list.length) return 0;
+  return Math.round(list.filter(t=>t.done).length / list.length * 100);
+}
+function getScore(id) {
+  const cl = Object.values(tasks[id]?.checklist  || {});
+  const dl = Object.values(tasks[id]?.delegation || {});
+  return Math.round((getPct(cl) + getPct(dl)) / 2);
+}
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2800);
+}
+function showLoading(msg='Loading...') {
+  document.getElementById('loadingOverlay').style.display = 'flex';
+  document.getElementById('loadingMsg').textContent = msg;
+}
+function hideLoading() {
+  document.getElementById('loadingOverlay').style.display = 'none';
+}
+
+/* ═══════════ FIREBASE: SEED DEFAULT DATA ═══════════ */
+async function seedIfEmpty() {
+  const snap = await get(ref(db, 'employees'));
+  if (snap.exists()) return; // already seeded
+
+  showLoading('Setting up database for the first time...');
+
+  const defaultEmps = [
+    {id:'emp0', name:'Admin',          role:'Owner',         shift:'Full Day', pin:'0000', access:'admin'},
+    {id:'emp1', name:'Manpreet Singh', role:'Store Manager', shift:'Full Day', pin:'1111', access:'manager'},
+    {id:'emp2', name:'Rohit Kumar',    role:'Sales Staff',   shift:'Morning',  pin:'2222', access:'staff'},
+    {id:'emp3', name:'Pankaj Sharma',  role:'Cashier',       shift:'Full Day', pin:'3333', access:'staff'},
+    {id:'emp4', name:'Anil Verma',     role:'Sales Staff',   shift:'Evening',  pin:'4444', access:'staff'},
+    {id:'emp5', name:'Raj Tailor',     role:'Tailor',        shift:'Full Day', pin:'5555', access:'staff'},
+  ];
+
+  const defaultTasks = {
+    emp1: {
+      checklist: {
+        t1:{text:'Open store & disable alarm',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Check WhatsApp orders & messages',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t3:{text:'Review previous day sales report',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t4:{text:'Lock store & set alarm at closing',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t5:{text:'Staff briefing & set weekly targets',freq:'weekly',done:false,doneAt:'',schedDate:'2026-03-23',schedTime:''},
+        t6:{text:'Monthly P&L review',freq:'monthly',done:false,doneAt:'',schedDate:'2026-03-01',schedTime:''},
+      },
+      delegation: {
+        t1:{text:'Set up store SOPs & operations manual',freq:'once',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Monthly performance review of all staff',freq:'monthly',done:false,doneAt:'',schedDate:'2026-03-01',schedTime:''},
+        t3:{text:'Annual store audit & licence renewal',freq:'yearly',done:false,doneAt:'',schedDate:'2026-01-01',schedTime:''},
+      }
+    },
+    emp2: {
+      checklist: {
+        t1:{text:'Restock shelves from backroom',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Assist walk-in customers on floor',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t3:{text:'Tidy fitting rooms after each use',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t4:{text:'Stock count of fast-moving items',freq:'weekly',done:false,doneAt:'',schedDate:'2026-03-23',schedTime:''},
+      },
+      delegation: {
+        t1:{text:'Memorise all product categories & pricing',freq:'once',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Learn POS billing system fully',freq:'once',done:false,doneAt:'',schedDate:'',schedTime:''},
+      }
+    },
+    emp3: {
+      checklist: {
+        t1:{text:'Count & verify opening cash drawer',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Process all bills & payments',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t3:{text:'End-of-day cash tally',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t4:{text:'Clear all pending khata entries',freq:'weekly',done:false,doneAt:'',schedDate:'2026-03-23',schedTime:''},
+        t5:{text:'GST entries & filing preparation',freq:'monthly',done:false,doneAt:'',schedDate:'2026-03-01',schedTime:''},
+      },
+      delegation: {
+        t1:{text:'Set up billing software & POS printer',freq:'once',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Create khata ledger for credit customers',freq:'once',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t3:{text:'Annual GST return filing',freq:'yearly',done:false,doneAt:'',schedDate:'2026-03-31',schedTime:''},
+      }
+    },
+    emp4: {
+      checklist: {
+        t1:{text:'Arrange front display & mannequins',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Fold & organise all display at close',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t3:{text:'Refresh mannequin outfits',freq:'weekly',done:false,doneAt:'',schedDate:'2026-03-23',schedTime:''},
+        t4:{text:'Update product photos for social media',freq:'monthly',done:false,doneAt:'',schedDate:'2026-03-01',schedTime:''},
+      },
+      delegation: {
+        t1:{text:'Plan & execute opening store display',freq:'once',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Create visual merchandising guide',freq:'once',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t3:{text:'Seasonal & festive display setup',freq:'monthly',done:false,doneAt:'',schedDate:'2026-03-01',schedTime:''},
+      }
+    },
+    emp5: {
+      checklist: {
+        t1:{text:'Complete & hand over pending alterations',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Log all new alteration orders',freq:'daily',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t3:{text:'Review alteration backlog with manager',freq:'weekly',done:false,doneAt:'',schedDate:'2026-03-23',schedTime:''},
+      },
+      delegation: {
+        t1:{text:'Set up tailoring workstation & tools',freq:'once',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t2:{text:'Create alteration price list',freq:'once',done:false,doneAt:'',schedDate:'',schedTime:''},
+        t3:{text:'Monthly alteration revenue report',freq:'monthly',done:false,doneAt:'',schedDate:'2026-03-01',schedTime:''},
+      }
+    }
+  };
+
+  const updates = {};
+  defaultEmps.forEach(e => { updates[`employees/${e.id}`] = e; });
+  Object.entries(defaultTasks).forEach(([eid, td]) => {
+    updates[`tasks/${eid}`] = td;
+  });
+  await update(ref(db), updates);
+  hideLoading();
+}
+
+/* ═══════════ FIREBASE: LOAD EMPLOYEES ═══════════ */
+async function loadEmployees() {
+  const snap = await get(ref(db, 'employees'));
+  employees = [];
+  if (snap.exists()) {
+    snap.forEach(child => {
+      employees.push({ _key: child.key, ...child.val() });
+    });
+  }
+}
+
+/* ═══════════ FIREBASE: LIVE SYNC TASKS ═══════════ */
+function startLiveSync() {
+  if (liveUnsub) liveUnsub();
+  liveUnsub = onValue(ref(db, 'tasks'), snap => {
+    tasks = {};
+    if (snap.exists()) {
+      snap.forEach(empSnap => {
+        const empKey = empSnap.key;
+        tasks[empKey] = { checklist: {}, delegation: {} };
+        empSnap.forEach(typeSnap => {
+          const type = typeSnap.key;
+          if (type === 'checklist' || type === 'delegation') {
+            typeSnap.forEach(taskSnap => {
+              tasks[empKey][type][taskSnap.key] = { _key: taskSnap.key, ...taskSnap.val() };
+            });
+          }
+        });
+      });
+    }
+    // Re-render current page live
+    refreshCurrentPage();
+  });
+}
+
+function refreshCurrentPage() {
+  const active = document.querySelector('.page.active');
+  if (!active) return;
+  const id = active.id;
+  if (id==='myChecklist')   renderMyChecklist();
+  else if (id==='myDelegation') renderMyDelegation();
+  else if (id==='mgrAddTasks') renderMgrAddTasks();
+  else if (id==='mgrPerf')    renderMgrPerf();
+  else if (id==='adminManage') renderAdminManage();
+  else if (id==='adminStaff') renderAdminStaff();
+}
+
+/* ═══════════ LOGIN ═══════════ */
+function populateSelect() {
+  const sel = document.getElementById('empSel');
+  sel.innerHTML = '<option value="">-- Select employee --</option>';
+  employees.forEach(e => {
+    const o = document.createElement('option');
+    o.value = e._key;
+    o.textContent = e.name + (e.access==='admin' ? ' (Admin)' : e.access==='manager' ? ' (Manager)' : ' ('+e.role+')');
+    sel.appendChild(o);
+  });
+}
+
+window.onEmpChange = () => {
+  document.getElementById('pinInp').value = '';
+  updateDots(0);
+  document.getElementById('loginErr').textContent = '';
+};
+window.onPinInput  = () => updateDots(document.getElementById('pinInp').value.length);
+function updateDots(n) {
+  for (let i=0; i<4; i++)
+    document.getElementById('pd'+i).className = 'pin-dot' + (i < n ? ' f' : '');
+}
+
+window.doLogin = async () => {
+  const key = document.getElementById('empSel').value;
+  const pin = document.getElementById('pinInp').value.trim();
+  const err = document.getElementById('loginErr');
+  if (!key) { err.textContent = 'Please select your name.'; return; }
+  if (pin.length !== 4) { err.textContent = 'PIN must be 4 digits.'; return; }
+  const emp = employees.find(e => e._key === key);
+  if (!emp || emp.pin !== pin) {
+    err.textContent = 'Wrong PIN. Try again.';
+    document.getElementById('pinInp').value = '';
+    updateDots(0);
+    return;
+  }
+  currentUser = emp;
+  err.textContent = '';
+  showApp();
+};
+
+window.doLogout = () => {
+  currentUser = null;
+  if (liveUnsub) { liveUnsub(); liveUnsub = null; }
+  document.getElementById('loginErr').textContent = '';
+  document.getElementById('pinInp').value = '';
+  document.getElementById('empSel').value = '';
+  updateDots(0);
+  document.getElementById('loginScreen').classList.add('active');
+  document.getElementById('appScreen').classList.remove('active');
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('myChecklist').classList.add('active');
+};
+
+/* ═══════════ APP ═══════════ */
+function showApp() {
+  document.getElementById('loginScreen').classList.remove('active');
+  document.getElementById('appScreen').classList.add('active');
+  const c  = avC(currentUser);
+  const av = document.getElementById('navAv');
+  av.style.cssText = `width:34px;height:34px;border-radius:50%;background:${c.bg};color:${c.cl};display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0`;
+  av.textContent = currentUser.name.split(' ').map(w=>w[0]).join('').slice(0,2);
+  document.getElementById('navName').textContent = currentUser.name;
+  document.getElementById('navSub').textContent  = currentUser.role + ' · ' + currentUser.shift;
+  const chip = document.getElementById('roleChip');
+  if (isAdmin())      { chip.textContent='Admin';   chip.className='role-chip chip-admin'; }
+  else if (isMgr())   { chip.textContent='Manager'; chip.className='role-chip chip-mgr';   }
+  else                { chip.textContent='Staff';   chip.className='role-chip chip-staff';  }
+  buildTabs();
+  startLiveSync();
+  goTab(isAdmin() ? 'adminManage' : 'myChecklist', 0);
+}
+
+function buildTabs() {
+  const bar  = document.getElementById('tabBar');
+  const tabs = isAdmin()
+    ? [{id:'adminManage',label:'Manage Tasks',cls:'t-admin'},{id:'adminStaff',label:'Manage Staff',cls:'t-admin'},{id:'mgrPerf',label:'Team Performance',cls:'t-admin'}]
+    : isMgr()
+      ? [{id:'myChecklist',label:'My Checklist'},{id:'myDelegation',label:'My Delegation'},{id:'mgrAddTasks',label:'Add Tasks',cls:'t-mgr'},{id:'mgrPerf',label:'Team Performance',cls:'t-mgr'}]
+      : [{id:'myChecklist',label:'My Checklist'},{id:'myDelegation',label:'My Delegation'}];
+  bar.innerHTML = tabs.map((t,i) =>
+    `<button class="tab-btn${t.cls?' '+t.cls:''}" id="tab_${i}" onclick="goTab('${t.id}',${i})">${t.label}</button>`
+  ).join('');
+}
+
+window.goTab = (pageId, idx) => {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(pageId).classList.add('active');
+  const btn = document.getElementById('tab_'+idx);
+  if (btn) btn.classList.add('active');
+  const renders = {
+    myChecklist:renderMyChecklist, myDelegation:renderMyDelegation,
+    mgrAddTasks:renderMgrAddTasks, mgrPerf:renderMgrPerf,
+    adminManage:renderAdminManage, adminStaff:renderAdminStaff
+  };
+  if (renders[pageId]) renders[pageId]();
+};
+
+/* ═══════════ TASK VIEW HELPERS ═══════════ */
+function getEmpKey(emp) { return emp._key; }
+function getTaskList(empKey, type) {
+  return Object.values(tasks[empKey]?.[type] || {});
+}
+
+function buildDateBar(dateObj, onChangeFn, prevFn, nextFn) {
+  return `<div class="date-bar">
+    <label>Date:</label>
+    <input type="date" value="${fmtDate(dateObj)}" onchange="${onChangeFn}"/>
+    <div class="date-disp">${fmtDisp(dateObj)}</div>
+    <div class="d-nav">
+      <button onclick="${prevFn}">&#8592;</button>
+      <button onclick="${nextFn}">&#8594;</button>
+      <button class="today-btn" onclick="window.clDate=new Date();renderMyChecklist()">Today</button>
+    </div>
+  </div>`;
+}
+
+/* ═══════════ MY CHECKLIST ═══════════ */
+function renderMyChecklist() {
+  const u   = currentUser;
+  const key = getEmpKey(u);
+  const list = getTaskList(key, 'checklist');
+  const done = list.filter(t=>t.done).length;
+  const pct  = getPct(list);
+  clDate = window.clDate;
+  const groups = {daily:[],weekly:[],monthly:[],yearly:[],once:[]};
+  list.forEach(t => { if (groups[t.freq]) groups[t.freq].push(t); else groups.daily.push(t); });
+  const labels = {daily:'Daily tasks',weekly:'Weekly tasks',monthly:'Monthly tasks',yearly:'Yearly tasks',once:'One-time tasks'};
+
+  let html = `
+  <div class="date-bar">
+    <label>Date:</label>
+    <input type="date" value="${fmtDate(clDate)}" onchange="window.clDate=new Date(this.value+'T00:00:00');renderMyChecklist()"/>
+    <div class="date-disp">${fmtDisp(clDate)}</div>
+    <div class="d-nav">
+      <button onclick="window.clDate=shiftDay(window.clDate,-1);renderMyChecklist()">&#8592;</button>
+      <button onclick="window.clDate=shiftDay(window.clDate,1);renderMyChecklist()">&#8594;</button>
+      <button class="today-btn" onclick="window.clDate=new Date();renderMyChecklist()">Today</button>
+    </div>
+  </div>
+  <div class="live-badge">&#9679; Live — ticks sync instantly to manager</div>
+  <div class="prog-wrap">
+    <div class="prog-top"><span>My checklist progress</span><span>${pct}%</span></div>
+    <div class="prog-bar"><div class="prog-fill" style="width:${pct}%;background:var(--green)"></div></div>
+    <div class="prog-sub">${done} of ${list.length} tasks completed</div>
+  </div>
+  <div class="ov-grid">
+    <div class="ov-card"><div class="ov-num">${done}</div><div class="ov-lbl">Done</div></div>
+    <div class="ov-card"><div class="ov-num">${list.length-done}</div><div class="ov-lbl">Remaining</div></div>
+    <div class="ov-card"><div class="ov-num">${pct}%</div><div class="ov-lbl">Complete</div></div>
+  </div>`;
+
+  Object.entries(groups).forEach(([freq, items]) => {
+    if (!items.length) return;
+    html += `<div class="sec-title">${labels[freq]}</div>`;
+    items.forEach(t => {
+      const sd = schedDisp(t);
+      const st = schedTimeDisp(t);
+      const status = getTaskStatus(t, clDate);
+      const statusBadge = status==='done-ontime' ? '<span class="status-badge s-ontime">&#10003; On time</span>'
+        : status==='done-late' ? '<span class="status-badge s-late">&#9888; Late</span>'
+        : status==='missed' ? '<span class="status-badge s-missed">&#10007; Missed</span>'
+        : '';
+      html += `<div class="task-card">
+        <div class="task-row${t.done?' done-row':status==='missed'?' missed-row':''}" onclick="toggleTask('checklist','${key}','${t._key}')">
+          <div class="chk${t.done?' done':''}" id="chk_cl_${t._key}"></div>
+          <div class="ttext${t.done?' x':''}">
+            ${t.text}
+            ${sd ? `<div class="sched-note">&#128197; ${sd}</div>` : ''}
+            ${st ? `<div class="sched-time-note">&#9200; Scheduled by: <strong>${t.schedTime}</strong>${t.doneAt ? ` &nbsp;|&nbsp; Done at: <strong>${t.doneAt}</strong>` : ''}</div>` : t.doneAt ? `<div class="sched-time-note">Done at: <strong>${t.doneAt}</strong></div>` : ''}
+          </div>
+          ${freqTag(t.freq)}
+          ${statusBadge}
+        </div>
+      </div>`;
+    });
+  });
+  if (!list.length) html += `<div class="empty-state">No tasks assigned yet. Ask your manager.</div>`;
+  document.getElementById('myChecklist').innerHTML = html;
+}
+
+/* ═══════════ MY DELEGATION ═══════════ */
+function renderMyDelegation() {
+  const u    = currentUser;
+  const key  = getEmpKey(u);
+  const list = getTaskList(key, 'delegation');
+  const done = list.filter(t=>t.done).length;
+  const pct  = getPct(list);
+  dlDate = window.dlDate;
+  const groups = {once:[],monthly:[],weekly:[],daily:[],yearly:[]};
+  list.forEach(t => { if (groups[t.freq]) groups[t.freq].push(t); else groups.once.push(t); });
+  const labels = {once:'One-time setup tasks',monthly:'Monthly tasks',weekly:'Weekly tasks',daily:'Daily tasks',yearly:'Yearly tasks'};
+
+  let html = `
+  <div class="date-bar">
+    <label>Date:</label>
+    <input type="date" value="${fmtDate(dlDate)}" onchange="window.dlDate=new Date(this.value+'T00:00:00');renderMyDelegation()"/>
+    <div class="date-disp">${fmtDisp(dlDate)}</div>
+    <div class="d-nav">
+      <button onclick="window.dlDate=shiftDay(window.dlDate,-1);renderMyDelegation()">&#8592;</button>
+      <button onclick="window.dlDate=shiftDay(window.dlDate,1);renderMyDelegation()">&#8594;</button>
+      <button class="today-btn" onclick="window.dlDate=new Date();renderMyDelegation()">Today</button>
+    </div>
+  </div>
+  <div class="live-badge">&#9679; Live — ticks sync instantly to manager</div>
+  <div class="prog-wrap">
+    <div class="prog-top"><span>Delegation progress</span><span>${pct}%</span></div>
+    <div class="prog-bar"><div class="prog-fill" style="width:${pct}%;background:#534AB7"></div></div>
+    <div class="prog-sub">${done} of ${list.length} completed</div>
+  </div>
+  <div class="ov-grid">
+    <div class="ov-card"><div class="ov-num">${done}</div><div class="ov-lbl">Done</div></div>
+    <div class="ov-card"><div class="ov-num">${list.filter(t=>t.freq==='once'&&t.done).length}/${list.filter(t=>t.freq==='once').length}</div><div class="ov-lbl">One-time</div></div>
+    <div class="ov-card"><div class="ov-num">${pct}%</div><div class="ov-lbl">Complete</div></div>
+  </div>`;
+
+  Object.entries(groups).forEach(([freq, items]) => {
+    if (!items.length) return;
+    html += `<div class="sec-title">${labels[freq]}</div>`;
+    items.forEach(t => {
+      const sd = schedDisp(t);
+      const st = schedTimeDisp(t);
+      const status = getTaskStatus(t, dlDate);
+      const statusBadge = status==='done-ontime' ? '<span class="status-badge s-ontime">&#10003; On time</span>'
+        : status==='done-late' ? '<span class="status-badge s-late">&#9888; Late</span>'
+        : status==='missed' ? '<span class="status-badge s-missed">&#10007; Missed</span>'
+        : '';
+      html += `<div class="task-card">
+        <div class="task-row${t.done?' done-row':status==='missed'?' missed-row':''}" onclick="toggleTask('delegation','${key}','${t._key}')">
+          <div class="chk${t.done?' done':''}" id="chk_dl_${t._key}"></div>
+          <div class="ttext${t.done?' x':''}">
+            ${t.text}
+            ${sd ? `<div class="sched-note">&#128197; ${sd}</div>` : ''}
+            ${st ? `<div class="sched-time-note">&#9200; Scheduled by: <strong>${t.schedTime}</strong>${t.doneAt ? ` &nbsp;|&nbsp; Done at: <strong>${t.doneAt}</strong>` : ''}</div>` : t.doneAt ? `<div class="sched-time-note">Done at: <strong>${t.doneAt}</strong></div>` : ''}
+          </div>
+          ${freqTag(t.freq)}
+          ${statusBadge}
+        </div>
+      </div>`;
+    });
+  });
+  if (!list.length) html += `<div class="empty-state">No delegation tasks assigned yet.</div>`;
+  document.getElementById('myDelegation').innerHTML = html;
+}
+
+/* ═══════════ TOGGLE TASK (Firebase write) ═══════════ */
+window.toggleTask = async (type, empKey, taskKey) => {
+  const t = tasks[empKey]?.[type]?.[taskKey];
+  if (!t) return;
+  const newDone = !t.done;
+  const fn = fullNow();
+  await update(ref(db, `tasks/${empKey}/${type}/${taskKey}`), {
+    done:     newDone,
+    doneAt:   newDone ? fn.time : '',
+    doneDate: newDone ? fn.date : '',
+    doneMonth:newDone ? fn.month : -1,
+    doneYear: newDone ? fn.year : -1,
+  });
+  toast(newDone ? 'Task marked done!' : 'Task unmarked');
+};
+
+/* ═══════════ MANAGER: ADD TASKS ═══════════ */
+function renderMgrAddTasks() {
+  const staffEmps = employees.filter(e => e.access === 'staff');
+  let html = `<div class="info-bar mgr-bar">Manager — you can add tasks to staff. To edit or delete tasks contact Admin.</div>`;
+  staffEmps.forEach(emp => {
+    const key  = getEmpKey(emp);
+    const cl   = getTaskList(key, 'checklist');
+    const dl   = getTaskList(key, 'delegation');
+    html += `<div class="emp-block">
+      <div class="emp-block-head">
+        ${avEl(emp, 36)}
+        <div style="flex:1"><div class="emp-n">${emp.name}</div><div class="emp-m">${emp.role} · ${emp.shift}</div></div>
+        <span style="font-size:.72rem;color:var(--mid)">${cl.length+dl.length} tasks</span>
+      </div>
+      <div class="tasks-section">
+        <div class="tasks-two-col">
+          ${buildSimpleTaskCol(cl,'checklist',key,'cl')}
+          ${buildSimpleTaskCol(dl,'delegation',key,'dl')}
+        </div>
+      </div>
+    </div>`;
+  });
+  document.getElementById('mgrAddTasks').innerHTML = html;
+}
+
+function buildSimpleTaskCol(list, type, empKey, prefix) {
+  const title = type==='checklist' ? 'Checklist Tasks' : 'Delegation Tasks';
+  let rows = list.map(t => {
+    const sd = schedDisp(t);
+    return `<div class="task-mini-row">
+      <div class="done-dot ${t.done?'g':'e'}"></div>
+      <span style="flex:1;font-size:.79rem">${t.text}${sd?`<div class="sched-note">&#128197; ${sd}</div>`:''}</span>
+      ${freqTag(t.freq)}
+    </div>`;
+  }).join('');
+  if (!list.length) rows = `<div style="font-size:.76rem;color:var(--mid);padding:6px 0">No tasks yet</div>`;
+
+  return `<div>
+    <div class="task-col-title">${title}</div>
+    <div style="margin-bottom:10px">${rows}</div>
+    <div class="add-task-row">
+      <input type="text" id="${prefix}_inp_${empKey}" placeholder="Add task..."/>
+      <select id="${prefix}_frq_${empKey}" onchange="mgrToggleSched('${prefix}','${empKey}')">
+        ${type==='delegation'?'<option value="once">Once</option>':''}
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+        <option value="yearly">Yearly</option>
+      </select>
+      <input type="time" id="${prefix}_tm_${empKey}" title="Scheduled time (must be done by)" placeholder="By time"/>
+      <input type="date" id="${prefix}_sd_${empKey}" style="display:none"/>
+      <button onclick="mgrAddTask('${type}','${empKey}','${prefix}')">+ Add</button>
+    </div>
+    <div id="${prefix}_hint_${empKey}" style="font-size:.63rem;color:var(--amber);margin-top:3px;display:none"></div>
+  </div>`;
+}
+
+window.mgrToggleSched = (prefix, empKey) => {
+  const f = document.getElementById(`${prefix}_frq_${empKey}`).value;
+  const sd = document.getElementById(`${prefix}_sd_${empKey}`);
+  const hint = document.getElementById(`${prefix}_hint_${empKey}`);
+  const show = (f==='weekly'||f==='monthly'||f==='yearly');
+  if (sd) sd.style.display = show ? 'block' : 'none';
+  if (hint) { hint.textContent = freqHint(f); hint.style.display = show ? 'block' : 'none'; }
+};
+
+window.mgrAddTask = async (type, empKey, prefix) => {
+  const inp  = document.getElementById(`${prefix}_inp_${empKey}`);
+  const frq  = document.getElementById(`${prefix}_frq_${empKey}`);
+  const sd   = document.getElementById(`${prefix}_sd_${empKey}`);
+  const tm   = document.getElementById(`${prefix}_tm_${empKey}`);
+  if (!inp || !inp.value.trim()) return;
+  const freq      = frq.value;
+  const schedDate = (freq==='daily'||freq==='once') ? '' : (sd?.value||'');
+  const schedTime = tm?.value||'';
+  const newRef    = push(ref(db, `tasks/${empKey}/${type}`));
+  await set(newRef, { text:inp.value.trim(), freq, done:false, doneAt:'', schedDate, schedTime });
+  inp.value = ''; if (sd) sd.value = ''; if (tm) tm.value = '';
+  toast('Task added');
+};
+
+/* ═══════════ TEAM PERFORMANCE ═══════════ */
+function renderMgrPerf() {
+  const selYear = new Date().getFullYear();
+  const staffEmps = employees.filter(e => e.access !== 'admin');
+  const scores    = staffEmps.map(e => {
+    const key = getEmpKey(e);
+    const cl  = getTaskList(key, 'checklist');
+    const dl  = getTaskList(key, 'delegation');
+    const clPerf = calcPerformanceScore(cl, selMonth, selYear);
+    const dlPerf = calcPerformanceScore(dl, selMonth, selYear);
+    const perfScore = Math.round((clPerf.score + dlPerf.score) / 2);
+    return { emp:e, key, cl, dl, clPerf, dlPerf, score:perfScore };
+  });
+  const avg      = scores.length ? Math.round(scores.reduce((a,s)=>a+s.score,0)/scores.length) : 0;
+  const top      = scores.length ? scores.reduce((a,s)=>s.score>a.score?s:a,scores[0]) : null;
+  const onTrack  = scores.filter(s=>s.score>=70).length;
+  const totalMissedAll = scores.reduce((a,s)=>a+s.clPerf.missed+s.dlPerf.missed,0);
+
+  let html = `<div class="live-badge" style="margin-bottom:16px">&#9679; Live — updates in real time as staff tick tasks</div>
+  <div class="month-row"><label>Viewing month:</label><select onchange="selMonth=parseInt(this.value);renderMgrPerf()">`;
+  MONTHS.forEach((m,i) => html += `<option value="${i}"${i===selMonth?' selected':''}>${m} ${selYear}</option>`);
+  html += `</select></div>
+  <div class="ov-grid" style="margin-bottom:20px">
+    <div class="ov-card"><div class="ov-num">${avg}%</div><div class="ov-lbl">Team avg — ${MONTHS[selMonth]}</div></div>
+    <div class="ov-card"><div class="ov-num">${onTrack}/${scores.length}</div><div class="ov-lbl">On track (70%+)</div></div>
+    <div class="ov-card"><div class="ov-num">${top?top.emp.name.split(' ')[0]:'—'}</div><div class="ov-lbl">Top performer</div></div>
+    <div class="ov-card"><div class="ov-num" style="color:#791F1F">${totalMissedAll}</div><div class="ov-lbl">Total missed</div></div>
+  </div><div class="perf-grid">`;
+
+  scores.forEach(({emp, cl, dl, clPerf, dlPerf, score}) => {
+    const perfScore = score;
+    const grade = perfScore>=85?'A':perfScore>=70?'B':perfScore>=50?'C':'D';
+    const [gbg,gcl] = perfScore>=85?['#EAF3DE','#27500A']:perfScore>=70?['#E6F1FB','#0C447C']:perfScore>=50?['#FAEEDA','#633806']:['#FCEBEB','#791F1F'];
+    const totalOnTime = clPerf.onTime + dlPerf.onTime;
+    const totalLate   = clPerf.late   + dlPerf.late;
+    const totalMissed = clPerf.missed + dlPerf.missed;
+    const totalPending= clPerf.pending+ dlPerf.pending;
+    html += `<div class="perf-card">
+      <div class="perf-top">${avEl(emp,40)}
+        <div style="flex:1">
+          <div style="font-size:.9rem;font-weight:600;color:var(--navy)">${emp.name}</div>
+          <div style="font-size:.72rem;color:var(--mid);margin-top:2px">${emp.role} · ${emp.shift}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="perf-score">${perfScore}%</div>
+          <span class="grade-pill" style="background:${gbg};color:${gcl}">Grade ${grade}</span>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px">
+        <div style="background:#EAF3DE;border-radius:8px;padding:7px 10px;text-align:center">
+          <div style="font-size:1.1rem;font-weight:600;color:#27500A">${totalOnTime}</div>
+          <div style="font-size:.65rem;color:#3B6D11;font-weight:500">ON TIME</div>
+        </div>
+        <div style="background:#FAEEDA;border-radius:8px;padding:7px 10px;text-align:center">
+          <div style="font-size:1.1rem;font-weight:600;color:#633806">${totalLate}</div>
+          <div style="font-size:.65rem;color:#854F0B;font-weight:500">LATE</div>
+        </div>
+        <div style="background:#FCEBEB;border-radius:8px;padding:7px 10px;text-align:center">
+          <div style="font-size:1.1rem;font-weight:600;color:#791F1F">${totalMissed}</div>
+          <div style="font-size:.65rem;color:#A32D2D;font-weight:500">MISSED</div>
+        </div>
+        <div style="background:#F1EFE8;border-radius:8px;padding:7px 10px;text-align:center">
+          <div style="font-size:1.1rem;font-weight:600;color:#444441">${totalPending}</div>
+          <div style="font-size:.65rem;color:#5F5E5A;font-weight:500">PENDING</div>
+        </div>
+      </div>
+      <div class="bar-lbl"><span>Checklist score</span><span>${clPerf.score}%</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${clPerf.score}%;background:#3B6D11"></div></div>
+      <div class="bar-lbl"><span>Delegation score</span><span>${dlPerf.score}%</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${dlPerf.score}%;background:#534AB7"></div></div>
+      ${totalMissed > 0 ? `
+      <div style="margin-top:10px;background:#FCEBEB;border-radius:8px;padding:10px 12px">
+        <div style="font-size:.7rem;font-weight:600;color:#791F1F;margin-bottom:6px;text-transform:uppercase;letter-spacing:.4px">&#10007; Missed Tasks</div>
+        ${[...cl,...dl].filter(t=>getTaskStatus(t)==='missed').map(t=>
+          `<div style="font-size:.75rem;color:#791F1F;padding:3px 0;border-bottom:0.5px solid #f0b8b8;display:flex;align-items:center;gap:6px">
+            <span style="flex:1">${t.text}</span>
+            <span style="font-size:.65rem;background:#FCEBEB;border:0.5px solid #f0b8b8;border-radius:10px;padding:1px 6px">${t.schedTime||t.freq}</span>
+          </div>`
+        ).join('')}
+      </div>` : ''}
+    </div>`;
+  });
+  document.getElementById('mgrPerf').innerHTML = html + '</div>';
+}
+
+/* ═══════════ ADMIN: MANAGE TASKS ═══════════ */
+function renderAdminManage() {
+  const staffEmps = employees.filter(e => e.access !== 'admin');
+  let html = `<div class="info-bar admin-bar">&#9881; Admin — Full task control. Add, edit and delete tasks for all staff.</div>`;
+  staffEmps.forEach(emp => {
+    const key = getEmpKey(emp);
+    const cl  = getTaskList(key, 'checklist');
+    const dl  = getTaskList(key, 'delegation');
+    html += `<div class="emp-block">
+      <div class="emp-block-head">
+        ${avEl(emp,36)}
+        <div style="flex:1"><div class="emp-n">${emp.name}</div><div class="emp-m">${emp.role} · ${emp.shift}</div></div>
+      </div>
+      <div class="tasks-section">
+        <div class="tasks-two-col">
+          ${buildAdminTaskCol(cl,'checklist',key,'cl')}
+          ${buildAdminTaskCol(dl,'delegation',key,'dl')}
+        </div>
+      </div>
+    </div>`;
+  });
+  document.getElementById('adminManage').innerHTML = html;
+}
+
+function buildAdminTaskCol(list, type, empKey, prefix) {
+  const title = type==='checklist' ? 'Checklist Tasks' : 'Delegation Tasks';
+  const et    = editingTask;
+  let rows    = '';
+  list.forEach(t => {
+    const isEt = et && et.type===type && et.empKey===empKey && et.taskKey===t._key;
+    const sd   = schedDisp(t);
+    if (isEt) {
+      const needSched = (t.freq==='weekly'||t.freq==='monthly'||t.freq==='yearly');
+      rows += `<tr style="background:#fffdf5">
+        <td colspan="5" style="padding:8px 5px">
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <input class="tei" id="et_text" value="${t.text}"/>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+              <select class="tes" id="et_freq" onchange="onAdminFreqChange()">
+                <option value="daily"${t.freq==='daily'?' selected':''}>Daily</option>
+                <option value="weekly"${t.freq==='weekly'?' selected':''}>Weekly</option>
+                <option value="monthly"${t.freq==='monthly'?' selected':''}>Monthly</option>
+                <option value="yearly"${t.freq==='yearly'?' selected':''}>Yearly</option>
+                <option value="once"${t.freq==='once'?' selected':''}>Once</option>
+              </select>
+              <input type="date" class="ted" id="et_sched" value="${t.schedDate||''}" style="display:${needSched?'block':'none'}"/>
+              <span id="et_hint" style="font-size:.63rem;color:var(--amber);display:${needSched?'inline':'none'}">${freqHint(t.freq)}</span>
+              <input type="time" class="ted" id="et_time" value="${t.schedTime||''}" title="Must be done by this time" style="width:120px"/>
+              <button class="save-tb" onclick="saveTaskEdit('${type}','${empKey}','${t._key}')">Save</button>
+              <button class="cancel-tb" onclick="clearEditTask()">Cancel</button>
+            </div>
+          </div>
+        </td>
+      </tr>`;
+    } else {
+      rows += `<tr>
+        <td><div class="done-dot ${t.done?'g':'e'}"></div></td>
+        <td style="max-width:180px;font-size:.79rem">${t.text}${sd?`<div class="sched-note">&#128197; ${sd}</div>`:''}</td>
+        <td>${freqTag(t.freq)}</td>
+        <td style="font-size:.67rem;color:${t.done?'var(--green)':'#ccc'}">${t.done?'&#10003; '+t.doneAt:'—'}</td>
+        <td style="white-space:nowrap">
+          <button class="edit-tb" onclick="startEditTask('${type}','${empKey}','${t._key}')">Edit</button>
+          <button class="del-tb" onclick="adminDelTask('${type}','${empKey}','${t._key}')">&#215;</button>
+        </td>
+      </tr>`;
+    }
+  });
+
+  return `<div>
+    <div class="task-col-title">${title}</div>
+    <table class="t-table">
+      <thead><tr><th style="width:16px"></th><th>Task</th><th style="width:72px">Freq</th><th style="width:62px">Done</th><th style="width:52px"></th></tr></thead>
+      <tbody>${rows}${!list.length?'<tr><td colspan="5" style="font-size:.75rem;color:var(--mid);padding:8px 5px">No tasks yet</td></tr>':''}</tbody>
+    </table>
+    <div class="add-task-row">
+      <input type="text" id="${prefix}_ainp_${empKey}" placeholder="Add task..."/>
+      <select id="${prefix}_afrq_${empKey}" onchange="adminToggleSched('${prefix}','${empKey}')">
+        ${type==='delegation'?'<option value="once">Once</option>':''}
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+        <option value="yearly">Yearly</option>
+      </select>
+      <input type="time" id="${prefix}_atm_${empKey}" title="Scheduled time (must be done by)" placeholder="By time"/>
+      <input type="date" id="${prefix}_asd_${empKey}" style="display:none"/>
+      <button onclick="adminAddTask('${type}','${empKey}','${prefix}')">+ Add</button>
+    </div>
+    <div id="${prefix}_ahint_${empKey}" style="font-size:.63rem;color:var(--amber);margin-top:3px;display:none"></div>
+  </div>`;
+}
+
+window.onAdminFreqChange = () => {
+  const f    = document.getElementById('et_freq').value;
+  const sd   = document.getElementById('et_sched');
+  const hint = document.getElementById('et_hint');
+  const show = (f==='weekly'||f==='monthly'||f==='yearly');
+  if (sd)   sd.style.display   = show ? 'block'  : 'none';
+  if (hint) { hint.textContent = freqHint(f); hint.style.display = show ? 'inline' : 'none'; }
+};
+window.startEditTask = (type, empKey, taskKey) => { setEditTask(type,empKey,taskKey); };
+window.saveTaskEdit  = async (type, empKey, taskKey) => {
+  const text  = document.getElementById('et_text').value.trim();
+  const freq  = document.getElementById('et_freq').value;
+  const sched = document.getElementById('et_sched').value;
+  const tm    = document.getElementById('et_time');
+  if (!text) { toast('Task name cannot be empty'); return; }
+  await update(ref(db, `tasks/${empKey}/${type}/${taskKey}`), {
+    text, freq,
+    schedDate:(freq==='daily'||freq==='once')?'':sched,
+    schedTime: tm ? tm.value : ''
+  });
+  editingTask = null;
+  toast('Task updated');
+};
+window.adminToggleSched = (prefix, empKey) => {
+  const f    = document.getElementById(`${prefix}_afrq_${empKey}`).value;
+  const sd   = document.getElementById(`${prefix}_asd_${empKey}`);
+  const hint = document.getElementById(`${prefix}_ahint_${empKey}`);
+  const show = (f==='weekly'||f==='monthly'||f==='yearly');
+  if (sd)   sd.style.display   = show ? 'block' : 'none';
+  if (hint) { hint.textContent = freqHint(f); hint.style.display = show ? 'block' : 'none'; }
+};
+window.adminAddTask = async (type, empKey, prefix) => {
+  const inp  = document.getElementById(`${prefix}_ainp_${empKey}`);
+  const frq  = document.getElementById(`${prefix}_afrq_${empKey}`);
+  const sd   = document.getElementById(`${prefix}_asd_${empKey}`);
+  const tm   = document.getElementById(`${prefix}_atm_${empKey}`);
+  if (!inp || !inp.value.trim()) return;
+  const freq      = frq.value;
+  const schedDate = (freq==='daily'||freq==='once') ? '' : (sd?.value||'');
+  const schedTime = tm?.value||'';
+  const newRef    = push(ref(db, `tasks/${empKey}/${type}`));
+  await set(newRef, { text:inp.value.trim(), freq, done:false, doneAt:'', schedDate, schedTime });
+  inp.value = ''; if (sd) sd.value = ''; if (tm) tm.value = '';
+  toast('Task added');
+};
+window.adminDelTask = async (type, empKey, taskKey) => {
+  if (!confirm('Delete this task permanently?')) return;
+  await remove(ref(db, `tasks/${empKey}/${type}/${taskKey}`));
+  if (editingTask?.taskKey === taskKey) editingTask = null;
+  toast('Task deleted');
+};
+
+/* ═══════════ ADMIN: MANAGE STAFF ═══════════ */
+function renderAdminStaff() {
+  let rows = '';
+  employees.forEach(emp => {
+    const c = avC(emp);
+    const ini = emp.name.split(' ').map(w=>w[0]).join('').slice(0,2);
+    const accessColor = emp.access==='admin'?'#E65100':emp.access==='manager'?'#633806':'#0C447C';
+    rows += `<div style="background:var(--white);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+        <div style="width:38px;height:38px;border-radius:50%;background:${c.bg};color:${c.cl};display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0">${ini}</div>
+        <div style="flex:1">
+          <div style="font-size:.9rem;font-weight:600;color:var(--navy)">${emp.name}</div>
+          <div style="font-size:.72rem;color:var(--mid)">${emp.role} &middot; ${emp.shift}</div>
+        </div>
+        <span style="font-size:.7rem;font-weight:700;padding:2px 9px;border-radius:20px;background:${emp.access==='admin'?'#FFF3E0':emp.access==='manager'?'var(--amber-bg)':'var(--blue-bg)'};color:${accessColor}">${emp.access.charAt(0).toUpperCase()+emp.access.slice(1)}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+        <div style="background:var(--cream);border-radius:8px;padding:8px 10px">
+          <div style="font-size:.67rem;color:var(--mid);text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px">Current PIN</div>
+          <div style="font-size:1.1rem;font-weight:700;color:var(--navy);letter-spacing:4px">${emp.pin}</div>
+        </div>
+        <div style="background:var(--cream);border-radius:8px;padding:8px 10px">
+          <div style="font-size:.67rem;color:var(--mid);text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px">New PIN</div>
+          <input type="number" id="pin_${emp._key}" maxlength="4" placeholder="Enter new PIN"
+            style="width:100%;border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:.85rem;font-family:'DM Sans',sans-serif;background:var(--white);outline:none;letter-spacing:3px"
+            oninput="if(this.value.length>4)this.value=this.value.slice(0,4)"/>
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button onclick="changePIN('${emp._key}','${emp.name}')"
+          style="padding:7px 16px;border-radius:8px;border:none;background:var(--navy);color:var(--gold);font-family:'DM Sans',sans-serif;font-size:.8rem;font-weight:600;cursor:pointer">
+          Save New PIN
+        </button>
+        <button onclick="changeRole('${emp._key}','${emp.name}','${emp.access}')"
+          style="padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:var(--white);color:var(--mid);font-family:'DM Sans',sans-serif;font-size:.8rem;cursor:pointer">
+          Change Role
+        </button>
+        ${emp._key !== currentUser._key ? `<button onclick="removeEmp('${emp._key}')"
+          style="padding:7px 14px;border-radius:8px;border:1px solid #f0b8b8;background:var(--white);color:var(--red);font-family:'DM Sans',sans-serif;font-size:.8rem;cursor:pointer">
+          Remove
+        </button>` : ''}
+      </div>
+    </div>`;
+  });
+
+  document.getElementById('adminStaff').innerHTML = `
+    <div class="info-bar admin-bar">&#9881; Admin — Change staff PINs, roles and manage staff here.</div>
+    <div class="mgmt-box">
+      <div class="mgmt-title">Add new staff member</div>
+      <div class="ae-row">
+        <input type="text" id="new_name" placeholder="Full name..."/>
+        <input type="text" id="new_role" placeholder="Role (e.g. Cashier)"/>
+        <select id="new_shift"><option>Full Day</option><option>Morning</option><option>Evening</option></select>
+        <input type="number" id="new_pin" maxlength="4" placeholder="4-digit PIN" style="max-width:96px;letter-spacing:3px" oninput="if(this.value.length>4)this.value=this.value.slice(0,4)"/>
+        <select id="new_access"><option value="staff">Staff</option><option value="manager">Manager</option><option value="admin">Admin</option></select>
+        <button onclick="addEmp()">+ Add</button>
+      </div>
+    </div>
+    <div class="mgmt-box">
+      <div class="mgmt-title">All staff — ${employees.length} members</div>
+      <div>${rows}</div>
+    </div>`;
+}
+
+window.changePIN = async (key, name) => {
+  const inp = document.getElementById(`pin_${key}`);
+  if (!inp) { toast('Error — please refresh page'); return; }
+  const pin = inp.value.trim();
+  if (pin.length !== 4 || isNaN(pin)) { toast('PIN must be exactly 4 digits'); inp.focus(); return; }
+  try {
+    await update(ref(db, `employees/${key}`), { pin });
+    await loadEmployees();
+    populateSelect();
+    renderAdminStaff();
+    toast(`${name}'s PIN changed to ${pin} successfully!`);
+  } catch(e) { toast('Failed to save. Try again.'); console.error(e); }
+};
+
+window.changeRole = async (key, name, currentAccess) => {
+  const roles = ['staff','manager','admin'];
+  const labels = ['Staff','Manager','Admin'];
+  const cur = roles.indexOf(currentAccess);
+  const next = (cur + 1) % roles.length;
+  if (!confirm(`Change ${name}'s role from ${labels[cur]} to ${labels[next]}?`)) return;
+  try {
+    await update(ref(db, `employees/${key}`), { access: roles[next] });
+    await loadEmployees();
+    populateSelect();
+    renderAdminStaff();
+    toast(`${name} is now ${labels[next]}`);
+  } catch(e) { toast('Failed to save. Try again.'); }
+};
+
+window.addEmp = async () => {
+  const name = document.getElementById('new_name').value.trim();
+  const pin  = document.getElementById('new_pin').value.trim();
+  if (!name) { toast('Enter a name'); return; }
+  if (pin.length !== 4 || isNaN(pin)) { toast('PIN must be 4 digits'); return; }
+  const role   = document.getElementById('new_role').value || 'Staff';
+  const shift  = document.getElementById('new_shift').value;
+  const access = document.getElementById('new_access').value;
+  const newRef = push(ref(db, 'employees'));
+  await set(newRef, { name, role, shift, pin, access });
+  await set(ref(db, `tasks/${newRef.key}`), { checklist:{}, delegation:{} });
+  document.getElementById('new_name').value = '';
+  document.getElementById('new_pin').value  = '';
+  document.getElementById('new_role').value = '';
+  await loadEmployees();
+  populateSelect();
+  renderAdminStaff();
+  toast(name + ' added');
+};
+window.removeEmp = async (key) => {
+  if (!confirm('Remove this staff member and all their tasks?')) return;
+  const emp = employees.find(e => e._key === key);
+  await remove(ref(db, `employees/${key}`));
+  await remove(ref(db, `tasks/${key}`));
+  await loadEmployees();
+  populateSelect();
+  editingEmp = null;
+  renderAdminStaff();
+  toast((emp?.name || 'Staff') + ' removed');
+};
+window.saveEmp = async (key) => {
+  const pinEl = document.getElementById(`ep_${key}`);
+  const nameEl = document.getElementById(`en_${key}`);
+  const roleEl = document.getElementById(`er_${key}`);
+  const shiftEl = document.getElementById(`es_${key}`);
+  const accessEl = document.getElementById(`ea_${key}`);
+  if (!pinEl || !nameEl) { toast('Error: form not found. Try clicking Edit again.'); return; }
+  const pin = pinEl.value.trim();
+  const name = nameEl.value.trim();
+  if (!name) { toast('Name cannot be empty'); return; }
+  if (pin.length !== 4 || isNaN(pin)) { toast('PIN must be exactly 4 digits (numbers only)'); return; }
+  try {
+    await update(ref(db, `employees/${key}`), {
+      name,
+      role:   roleEl ? roleEl.value.trim() : '',
+      shift:  shiftEl ? shiftEl.value : 'Full Day',
+      pin,
+      access: accessEl ? accessEl.value : 'staff'
+    });
+    await loadEmployees();
+    populateSelect();
+    editingEmp = null;
+    renderAdminStaff();
+    toast(`${name} updated successfully! New PIN: ${pin}`);
+  } catch(e) {
+    toast('Save failed. Please try again.');
+    console.error(e);
+  }
+};
+
+/* ═══════════ EXPOSE GLOBALS FOR HTML ONCLICK ═══════════ */
+window.shiftDay       = shiftDay;
+window.renderMyChecklist  = renderMyChecklist;
+window.renderMyDelegation = renderMyDelegation;
+window.renderMgrPerf      = renderMgrPerf;
+window.renderAdminStaff   = renderAdminStaff;
+window.renderAdminManage  = renderAdminManage;
+window.renderMgrAddTasks  = renderMgrAddTasks;
+window.selMonth           = selMonth;
+window.clDate             = clDate;
+window.dlDate             = dlDate;
+window.setEditEmp = (key) => { editingEmp = key; renderAdminStaff(); };
+window.clearEditEmp = () => { editingEmp = null; renderAdminStaff(); };
+window.setEditTask = (type, empKey, taskKey) => { editingTask={type,empKey,taskKey}; renderAdminManage(); };
+window.clearEditTask = () => { editingTask = null; renderAdminManage(); };
+
+/* ═══════════ INIT ═══════════ */
+async function autoResetDailyTasks() {
+  // Reset daily tasks if they were done on a previous day
+  const todayDate = fmtDate(new Date());
+  const snap = await get(ref(db, 'tasks'));
+  if (!snap.exists()) return;
+  const updates = {};
+  snap.forEach(empSnap => {
+    empSnap.forEach(typeSnap => {
+      if (typeSnap.key === 'checklist' || typeSnap.key === 'delegation') {
+        typeSnap.forEach(taskSnap => {
+          const t = taskSnap.val();
+          // Reset daily tasks done on a previous day
+          if (t.done && t.freq === 'daily' && t.doneDate && t.doneDate !== todayDate) {
+            const path = `${empSnap.key}/${typeSnap.key}/${taskSnap.key}`;
+            updates[path + '/done']      = false;
+            updates[path + '/doneAt']    = '';
+            updates[path + '/doneDate']  = '';
+            updates[path + '/doneMonth'] = -1;
+            updates[path + '/doneYear']  = -1;
+          }
+          // Reset weekly tasks done more than 7 days ago
+          if (t.done && t.freq === 'weekly' && t.doneDate) {
+            const doneD  = new Date(t.doneDate + 'T00:00:00');
+            const today  = new Date(todayDate  + 'T00:00:00');
+            const diffDays = Math.floor((today - doneD) / (1000*60*60*24));
+            if (diffDays >= 7) {
+              const path = `${empSnap.key}/${typeSnap.key}/${taskSnap.key}`;
+              updates[path + '/done']      = false;
+              updates[path + '/doneAt']    = '';
+              updates[path + '/doneDate']  = '';
+              updates[path + '/doneMonth'] = -1;
+              updates[path + '/doneYear']  = -1;
+            }
+          }
+          // Reset monthly tasks done more than 30 days ago
+          if (t.done && t.freq === 'monthly' && t.doneDate) {
+            const doneD  = new Date(t.doneDate + 'T00:00:00');
+            const today  = new Date(todayDate  + 'T00:00:00');
+            const diffDays = Math.floor((today - doneD) / (1000*60*60*24));
+            if (diffDays >= 30) {
+              const path = `${empSnap.key}/${typeSnap.key}/${taskSnap.key}`;
+              updates[path + '/done']      = false;
+              updates[path + '/doneAt']    = '';
+              updates[path + '/doneDate']  = '';
+              updates[path + '/doneMonth'] = -1;
+              updates[path + '/doneYear']  = -1;
+            }
+          }
+          // Reset yearly tasks done more than 365 days ago
+          if (t.done && t.freq === 'yearly' && t.doneDate) {
+            const doneD  = new Date(t.doneDate + 'T00:00:00');
+            const today  = new Date(todayDate  + 'T00:00:00');
+            const diffDays = Math.floor((today - doneD) / (1000*60*60*24));
+            if (diffDays >= 365) {
+              const path = `${empSnap.key}/${typeSnap.key}/${taskSnap.key}`;
+              updates[path + '/done']      = false;
+              updates[path + '/doneAt']    = '';
+              updates[path + '/doneDate']  = '';
+              updates[path + '/doneMonth'] = -1;
+              updates[path + '/doneYear']  = -1;
+            }
+          }
+        });
+      }
+    });
+  });
+  if (Object.keys(updates).length > 0) {
+    await update(ref(db, 'tasks'), updates);
+    console.log(`Auto-reset ${Object.keys(updates).length/5} tasks from previous cycles`);
+  }
+}
+
+async function init() {
+  showLoading('Connecting to database...');
+  try {
+    await seedIfEmpty();
+    await loadEmployees();
+    await autoResetDailyTasks();
+    populateSelect();
+    hideLoading();
+    document.getElementById('loginScreen').classList.add('active');
+  } catch(e) {
+    hideLoading();
+    document.getElementById('loginScreen').classList.add('active');
+    document.getElementById('loginErr').textContent = 'Database connection failed. Check your Firebase config.';
+    console.error(e);
+  }
+}
+init();
+</script>
+
+<style>
+:root{
+  --navy:#0d1b2a;--gold:#c9a84c;--gold-light:#e8c97e;
+  --cream:#f8f4ee;--charcoal:#2c2c2c;--mid:#6b6b6b;
+  --border:#e0d8cc;--white:#fff;
+  --green:#3B6D11;--green-bg:#EAF3DE;
+  --blue:#0C447C;--blue-bg:#E6F1FB;
+  --amber:#633806;--amber-bg:#FAEEDA;
+  --purple:#3C3489;--purple-bg:#EEEDFE;
+  --red:#791F1F;--red-bg:#FCEBEB;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'DM Sans',sans-serif;background:var(--cream);color:var(--charcoal);min-height:100vh;}
+.screen{display:none;}.screen.active{display:block;}
+#loginScreen{min-height:100vh;display:none;align-items:center;justify-content:center;background:var(--navy);}
+#loginScreen.active{display:flex;}
+.login-box{background:var(--white);border-radius:20px;padding:48px 40px;width:100%;max-width:400px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.45);}
+.login-logo{font-family:'Cormorant Garamond',serif;font-size:2rem;font-weight:700;color:var(--navy);letter-spacing:3px;margin-bottom:4px;}
+.login-sub{font-size:.76rem;color:var(--mid);letter-spacing:1px;text-transform:uppercase;margin-bottom:30px;}
+.role-legend{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:20px;}
+.rl-badge{font-size:.66rem;font-weight:600;padding:3px 10px;border-radius:20px;}
+.rl-admin{background:#FFF3E0;color:#BF360C;}
+.rl-mgr{background:var(--amber-bg);color:var(--amber);}
+.rl-staff{background:var(--blue-bg);color:var(--blue);}
+.ll{font-size:.71rem;font-weight:600;color:var(--mid);text-transform:uppercase;letter-spacing:.5px;text-align:left;display:block;margin-bottom:6px;}
+.lsel,.lpin{width:100%;padding:11px 14px;border:1.5px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:.9rem;color:var(--charcoal);background:var(--cream);outline:none;margin-bottom:14px;}
+.lsel:focus,.lpin:focus{border-color:var(--gold);background:var(--white);}
+.lbtn{width:100%;padding:13px;border-radius:10px;border:none;background:var(--navy);color:var(--gold);font-family:'DM Sans',sans-serif;font-size:.95rem;font-weight:600;cursor:pointer;}
+.lbtn:hover{background:#1a2e42;}
+.lerr{color:#a02020;font-size:.8rem;margin-top:10px;min-height:18px;}
+.pin-dots{display:flex;justify-content:center;gap:10px;margin-bottom:8px;}
+.pin-dot{width:12px;height:12px;border-radius:50%;border:2px solid var(--border);}
+.pin-dot.f{background:var(--navy);border-color:var(--navy);}
+nav{background:var(--navy);display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:62px;position:sticky;top:0;z-index:100;box-shadow:0 2px 20px rgba(0,0,0,.3);}
+.nav-logo{font-family:'Cormorant Garamond',serif;font-size:1.3rem;font-weight:700;color:var(--gold);letter-spacing:2px;}
+.nav-logo span{color:rgba(255,255,255,.6);font-weight:400;}
+.nav-right{display:flex;align-items:center;gap:10px;}
+.nav-name{font-size:.82rem;color:rgba(255,255,255,.88);font-weight:500;}
+.nav-sub{font-size:.68rem;color:rgba(255,255,255,.45);}
+.role-chip{font-size:.66rem;font-weight:700;padding:2px 9px;border-radius:20px;}
+.chip-admin{background:#FF6D00;color:#fff;}
+.chip-mgr{background:var(--gold);color:var(--navy);}
+.chip-staff{background:rgba(255,255,255,.15);color:rgba(255,255,255,.8);}
+.lo-btn{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.65);font-family:'DM Sans',sans-serif;font-size:.73rem;padding:5px 12px;border-radius:20px;cursor:pointer;}
+.tab-bar{background:var(--white);border-bottom:1px solid var(--border);display:flex;padding:0 28px;position:sticky;top:62px;z-index:90;overflow-x:auto;}
+.tab-btn{padding:13px 18px;font-family:'DM Sans',sans-serif;font-size:.82rem;font-weight:500;color:var(--mid);background:none;border:none;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;}
+.tab-btn.active{color:var(--navy);border-bottom-color:var(--gold);font-weight:600;}
+.tab-btn.t-mgr{color:#9b6e00;}
+.tab-btn.t-mgr.active{color:var(--amber);border-bottom-color:var(--gold);}
+.tab-btn.t-admin{color:#BF360C;}
+.tab-btn.t-admin.active{color:#E65100;border-bottom-color:#FF6D00;}
+.page{display:none;padding:22px;max-width:980px;margin:0 auto;}
+.page.active{display:block;}
+.live-badge{display:inline-flex;align-items:center;gap:6px;font-size:.72rem;font-weight:600;color:#27500A;background:#EAF3DE;padding:4px 12px;border-radius:20px;margin-bottom:14px;}
+.date-bar{display:flex;align-items:center;gap:10px;background:var(--white);border:1px solid var(--border);border-radius:12px;padding:10px 16px;margin-bottom:16px;flex-wrap:wrap;}
+.date-bar label{font-size:.7rem;font-weight:600;color:var(--mid);text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;}
+.date-bar input[type=date]{padding:6px 10px;border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.84rem;color:var(--charcoal);background:var(--cream);outline:none;cursor:pointer;}
+.date-disp{font-size:.87rem;font-weight:600;color:var(--navy);flex:1;}
+.d-nav button{padding:4px 10px;border-radius:20px;border:1px solid var(--border);background:var(--white);color:var(--mid);font-family:'DM Sans',sans-serif;font-size:.73rem;cursor:pointer;margin-left:4px;}
+.today-btn{background:var(--navy)!important;color:var(--gold)!important;border-color:var(--navy)!important;}
+.ov-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin-bottom:16px;}
+.ov-card{background:var(--white);border:1px solid var(--border);border-radius:12px;padding:14px 16px;border-top:3px solid var(--gold);}
+.ov-num{font-family:'Cormorant Garamond',serif;font-size:1.75rem;font-weight:700;color:var(--navy);line-height:1;}
+.ov-lbl{font-size:.67rem;color:var(--mid);margin-top:4px;font-weight:500;letter-spacing:.4px;text-transform:uppercase;}
+.prog-wrap{background:var(--white);border:1px solid var(--border);border-radius:12px;padding:14px 18px;margin-bottom:16px;}
+.prog-top{display:flex;justify-content:space-between;font-size:.8rem;font-weight:600;color:var(--navy);margin-bottom:7px;}
+.prog-bar{height:7px;background:var(--border);border-radius:4px;overflow:hidden;}
+.prog-fill{height:100%;border-radius:4px;transition:width .4s;}
+.prog-sub{font-size:.7rem;color:var(--mid);margin-top:5px;}
+.sec-title{font-family:'Cormorant Garamond',serif;font-size:1.05rem;font-weight:600;color:var(--navy);margin:16px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--border);}
+.task-card{background:var(--white);border:1px solid var(--border);border-radius:11px;margin-bottom:7px;}
+.task-card:hover{box-shadow:0 3px 10px rgba(0,0,0,.05);}
+.task-row{display:flex;align-items:center;gap:11px;padding:11px 15px;cursor:pointer;user-select:none;}
+.task-row.done-row{background:#fdfdf7;}
+.chk{width:19px;height:19px;border-radius:4px;border:1.5px solid var(--border);flex-shrink:0;display:flex;align-items:center;justify-content:center;background:var(--white);}
+.chk.done{background:var(--green);border-color:var(--green);}
+.chk.done::after{content:'';width:5px;height:9px;border:2px solid #fff;border-top:none;border-left:none;transform:rotate(40deg) translateY(-1px);display:block;}
+.ttext{font-size:.87rem;color:var(--charcoal);flex:1;line-height:1.4;}
+.ttext.x{text-decoration:line-through;color:#bbb;}
+.done-time{font-size:.68rem;color:var(--green);font-weight:500;white-space:nowrap;}
+.sched-note{font-size:.62rem;color:var(--amber);margin-top:2px;font-weight:500;}
+.sched-time-note{font-size:.62rem;color:var(--blue);margin-top:2px;}
+.missed-row{background:#fff8f8!important;border-left:3px solid #f0b8b8;}
+.status-badge{font-size:.65rem;font-weight:700;padding:2px 8px;border-radius:20px;white-space:nowrap;flex-shrink:0;}
+.s-ontime{background:#EAF3DE;color:#27500A;}
+.s-late{background:#FAEEDA;color:#633806;}
+.s-missed{background:#FCEBEB;color:#791F1F;}
+.freq-tag{font-size:.64rem;font-weight:600;padding:2px 7px;border-radius:20px;flex-shrink:0;}
+.f-daily{background:var(--green-bg);color:var(--green);}
+.f-weekly{background:var(--blue-bg);color:var(--blue);}
+.f-monthly{background:var(--amber-bg);color:var(--amber);}
+.f-yearly{background:var(--purple-bg);color:var(--purple);}
+.f-once{background:#f0e8fb;color:#5a2d82;}
+.empty-state{text-align:center;padding:32px;color:var(--mid);font-size:.86rem;}
+.info-bar{border-radius:10px;padding:11px 16px;font-size:.82rem;font-weight:500;margin-bottom:16px;}
+.mgr-bar{background:var(--amber-bg);border:0.5px solid #d4a96a;color:var(--amber);}
+.admin-bar{background:#FFF3E0;border:0.5px solid #FFCC80;color:#BF360C;}
+.emp-block{background:var(--white);border:1px solid var(--border);border-radius:14px;margin-bottom:12px;overflow:hidden;}
+.emp-block-head{display:flex;align-items:center;gap:12px;padding:13px 18px;background:#fdfbf8;border-bottom:1px solid var(--border);}
+.emp-n{font-size:.9rem;font-weight:600;color:var(--navy);}
+.emp-m{font-size:.72rem;color:var(--mid);margin-top:1px;}
+.tasks-section{padding:14px 18px;}
+.tasks-two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px;}
+@media(max-width:640px){.tasks-two-col{grid-template-columns:1fr;}}
+.task-col-title{font-size:.69rem;font-weight:600;color:var(--mid);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid var(--border);}
+.task-mini-row{display:flex;align-items:center;gap:7px;padding:6px 0;border-bottom:0.5px solid var(--border);font-size:.79rem;}
+.task-mini-row:last-child{border-bottom:none;}
+.done-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+.done-dot.g{background:var(--green);}
+.done-dot.e{background:#ddd;}
+.t-table{width:100%;border-collapse:collapse;margin-bottom:8px;}
+.t-table th{font-size:.63rem;font-weight:600;color:var(--mid);text-transform:uppercase;letter-spacing:.3px;padding:4px 5px;border-bottom:1px solid var(--border);text-align:left;}
+.t-table td{padding:6px 5px;border-bottom:1px solid var(--border);vertical-align:middle;}
+.t-table tr:last-child td{border-bottom:none;}
+.t-table tr:hover td{background:#fdfbf8;}
+.tei{width:100%;padding:5px 8px;border:1px solid var(--gold);border-radius:6px;font-family:'DM Sans',sans-serif;font-size:.79rem;color:var(--charcoal);background:var(--white);outline:none;}
+.tes{padding:5px 7px;border:1px solid var(--border);border-radius:6px;font-family:'DM Sans',sans-serif;font-size:.77rem;color:var(--charcoal);background:var(--white);outline:none;}
+.ted{padding:5px 7px;border:1px solid var(--border);border-radius:6px;font-family:'DM Sans',sans-serif;font-size:.77rem;color:var(--charcoal);background:var(--white);outline:none;width:130px;}
+.save-tb{padding:4px 10px;border-radius:16px;border:1px solid var(--green);background:var(--green-bg);color:var(--green);font-family:'DM Sans',sans-serif;font-size:.71rem;cursor:pointer;font-weight:600;}
+.cancel-tb{padding:4px 10px;border-radius:16px;border:1px solid var(--border);background:var(--white);color:var(--mid);font-family:'DM Sans',sans-serif;font-size:.71rem;cursor:pointer;}
+.del-tb{background:none;border:none;color:#ddd;font-size:14px;padding:1px 4px;border-radius:4px;cursor:pointer;}
+.del-tb:hover{background:var(--red-bg);color:var(--red);}
+.edit-tb{background:none;border:none;color:#bbb;font-size:.7rem;padding:2px 6px;border-radius:4px;cursor:pointer;font-family:'DM Sans',sans-serif;}
+.edit-tb:hover{background:var(--blue-bg);color:var(--blue);}
+.add-task-row{display:flex;gap:6px;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--border);}
+.add-task-row input{flex:1;min-width:100px;padding:6px 9px;border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.79rem;color:var(--charcoal);background:var(--cream);outline:none;}
+.add-task-row input:focus{border-color:var(--gold);background:var(--white);}
+.add-task-row input[type=date]{flex:none;width:132px;}
+.add-task-row select{padding:6px 7px;border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.77rem;color:var(--charcoal);background:var(--cream);outline:none;}
+.add-task-row button{padding:6px 12px;border-radius:8px;border:1px solid var(--navy);background:var(--navy);color:var(--gold);font-family:'DM Sans',sans-serif;font-size:.77rem;font-weight:600;cursor:pointer;}
+.mgmt-box{background:var(--white);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:12px;}
+.mgmt-title{font-family:'Cormorant Garamond',serif;font-size:1.05rem;font-weight:600;color:var(--navy);margin-bottom:13px;}
+.ae-row{display:flex;gap:8px;flex-wrap:wrap;}
+.ae-row input,.ae-row select{padding:7px 9px;border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.82rem;color:var(--charcoal);background:var(--cream);outline:none;}
+.ae-row input{flex:1;min-width:100px;}
+.ae-row button{padding:8px 14px;border-radius:8px;border:1px solid var(--navy);background:var(--navy);color:var(--gold);font-family:'DM Sans',sans-serif;font-size:.82rem;font-weight:600;cursor:pointer;}
+.btn-row{display:flex;gap:5px;flex-shrink:0;}
+.bx{font-size:.7rem;padding:4px 10px;border-radius:20px;border:1px solid var(--border);background:var(--white);color:var(--mid);cursor:pointer;font-family:'DM Sans',sans-serif;font-weight:500;white-space:nowrap;}
+.bx:hover{background:var(--cream);}
+.bx-save{border-color:#b5d4a0;color:var(--green);}
+.bx-save:hover{background:var(--green-bg);}
+.bx-danger{border-color:#f0b8b8;color:var(--red);}
+.bx-danger:hover{background:var(--red-bg);}
+.edit-fields{flex:1;display:flex;flex-direction:column;gap:5px;}
+.edit-fields input,.edit-fields select{padding:5px 9px;border:1px solid var(--border);border-radius:7px;font-family:'DM Sans',sans-serif;font-size:.8rem;color:var(--charcoal);background:var(--cream);outline:none;}
+.edit-sub{display:flex;gap:5px;}
+.edit-sub select,.edit-sub input{flex:1;}
+.perf-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:13px;}
+.perf-card{background:var(--white);border:1px solid var(--border);border-radius:14px;padding:16px;}
+.perf-top{display:flex;align-items:center;gap:10px;margin-bottom:13px;}
+.perf-score{font-family:'Cormorant Garamond',serif;font-size:1.8rem;font-weight:700;color:var(--navy);line-height:1;}
+.grade-pill{font-size:.68rem;font-weight:700;padding:3px 9px;border-radius:20px;display:inline-block;margin-top:3px;}
+.bar-lbl{display:flex;justify-content:space-between;font-size:.7rem;color:var(--mid);margin-bottom:3px;}
+.bar-track{height:5px;background:var(--border);border-radius:3px;overflow:hidden;margin-bottom:8px;}
+.bar-fill{height:100%;border-radius:3px;transition:width .4s;}
+.month-row{display:flex;align-items:center;gap:10px;margin-bottom:18px;flex-wrap:wrap;}
+.month-row label{font-size:.82rem;color:var(--mid);font-weight:500;}
+.month-row select{padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.82rem;color:var(--charcoal);background:var(--white);outline:none;}
+#loadingOverlay{position:fixed;inset:0;background:var(--navy);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;}
+.loading-logo{font-family:'Cormorant Garamond',serif;font-size:1.8rem;font-weight:700;color:var(--gold);letter-spacing:3px;margin-bottom:20px;}
+.loading-spinner{width:36px;height:36px;border:3px solid rgba(201,168,76,.2);border-top-color:var(--gold);border-radius:50%;animation:spin .8s linear infinite;margin-bottom:14px;}
+@keyframes spin{to{transform:rotate(360deg)}}
+#loadingMsg{font-size:.82rem;color:rgba(255,255,255,.5);}
+#toast{position:fixed;bottom:22px;right:22px;background:var(--navy);color:var(--gold-light);padding:10px 18px;border-radius:10px;font-size:.81rem;font-weight:500;opacity:0;transform:translateY(8px);transition:all .3s;z-index:999;pointer-events:none;box-shadow:0 6px 20px rgba(0,0,0,.25);}
+#toast.show{opacity:1;transform:translateY(0);}
+@media(max-width:600px){nav{padding:0 12px;}.tab-bar{padding:0 6px;}.page{padding:12px 10px;}.login-box{padding:26px 16px;margin:12px;}}
+</style>
+</head>
+<body>
+
+<!-- LOADING -->
+<div id="loadingOverlay">
+  <div class="loading-logo">PAL MENS WEAR</div>
+  <div class="loading-spinner"></div>
+  <div id="loadingMsg">Connecting...</div>
+</div>
+
+<!-- LOGIN -->
+<div id="loginScreen" class="screen">
+  <div class="login-box">
+    <div class="login-logo">PAL <span style="color:var(--mid);font-weight:400">MENS WEAR</span></div>
+    <div class="login-sub">Staff Portal</div>
+    <div class="role-legend">
+      <span class="rl-badge rl-admin">Admin</span>
+      <span class="rl-badge rl-mgr">Manager</span>
+      <span class="rl-badge rl-staff">Staff</span>
+    </div>
+    <label class="ll">Select your name</label>
+    <select class="lsel" id="empSel" onchange="onEmpChange()">
+      <option value="">-- Select employee --</option>
+    </select>
+    <label class="ll">Enter your PIN</label>
+    <div class="pin-dots" id="pinDots">
+      <div class="pin-dot" id="pd0"></div><div class="pin-dot" id="pd1"></div>
+      <div class="pin-dot" id="pd2"></div><div class="pin-dot" id="pd3"></div>
+    </div>
+    <input class="lpin" type="password" id="pinInp" maxlength="4" placeholder="4-digit PIN"
+      oninput="onPinInput()" onkeydown="if(event.key==='Enter')doLogin()"/>
+    <button class="lbtn" onclick="doLogin()">Sign In</button>
+    <div class="lerr" id="loginErr"></div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="appScreen" class="screen">
+  <nav>
+    <div class="nav-logo">PAL <span>MENS WEAR</span></div>
+    <div class="nav-right">
+      <div style="text-align:right">
+        <div class="nav-name" id="navName"></div>
+        <div class="nav-sub"  id="navSub"></div>
+      </div>
+      <div id="navAv"></div>
+      <div class="role-chip" id="roleChip"></div>
+      <button class="lo-btn" onclick="doLogout()">Sign out</button>
+    </div>
+  </nav>
+  <div class="tab-bar" id="tabBar"></div>
+  <div id="myChecklist"  class="page active"></div>
+  <div id="myDelegation" class="page"></div>
+  <div id="mgrAddTasks"  class="page"></div>
+  <div id="mgrPerf"      class="page"></div>
+  <div id="adminManage"  class="page"></div>
+  <div id="adminStaff"   class="page"></div>
+</div>
+
+<div id="toast"></div>
+</body>
+</html>
